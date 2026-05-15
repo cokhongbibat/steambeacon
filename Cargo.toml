@@ -44,3 +44,6 @@ thiserror = "2"
 rand = "0.8"
 # Futures
 futures = "0.3"
+# Cron-style scheduling (alongside interval)
+cron = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

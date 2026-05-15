@@ -15,6 +15,8 @@ pub struct CycleSummary {
     pub timed_out: usize,
     pub no_csgo_online: usize,
     pub decrypt_failed: usize,
+    pub invalid_token: usize,
+    pub skipped: usize,
     pub deadline_exceeded: bool,
 }
 
@@ -53,6 +55,8 @@ mod tests {
             timed_out: 0,
             no_csgo_online: 0,
             decrypt_failed: 0,
+            invalid_token: 0,
+            skipped: 0,
             deadline_exceeded: false,
         }
     }
@@ -64,7 +68,6 @@ mod tests {
             s.record_end(summary(i));
         }
         assert_eq!(s.history.len(), HISTORY_LEN);
-        // Oldest 3 evicted: first surviving entry is the 4th insertion (i=3)
         assert_eq!(s.history.front().unwrap().started_unix_secs, 3);
         assert_eq!(
             s.history.back().unwrap().started_unix_secs,

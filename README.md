@@ -31,6 +31,15 @@ startup rather than running broken.
 | `BOOST_INTERVAL_JITTER_SECS` | no | `60` | Random jitter `[0, jitter]` added to each tick |
 | `BOOST_CYCLE_DEADLINE_SECS` | no | `900` (15 min) | Per-cycle hard deadline |
 | `BOOST_APP_IDS` | no | `730` | Comma-separated Steam app ids passed to `games_played` |
+| `BOOST_ACCOUNTS_PER_CYCLE` | no | `20` | Accounts requested per cycle (`?limit=` on bot fetch) |
+| `BOOST_CRON` | no | — | Cron expression (6-field with seconds, e.g. `0 */5 * * * *`). If set, overrides `BOOST_INTERVAL_SECS` for next-wake; deadline + jitter still apply. |
+| `BOOST_COOLDOWN_THRESHOLD` | no | `3` | Consecutive per-account failures before that steam_id is benched. `0` disables. |
+| `BOOST_COOLDOWN_CYCLES` | no | `2` | Number of cycles to bench an account after it hits the threshold. |
+| `BOT_API_MAX_RETRIES` | no | `2` | Retries for `getRandomStoreMyAccountWithToken` with exp backoff (500ms→1s→2s→4s→8s, +jitter). |
+| `DISCORD_WEBHOOK_URL` | no | — | If set, post a Discord embed when a cycle is degraded (deadline exceeded, or success ratio below threshold). |
+| `BOOST_ALERT_THRESHOLD_RATIO` | no | `0.5` | Success-ratio threshold for alerting (`succeeded / (total - skipped)`). |
+| `PUBLIC_OBSERVABILITY` | no | `false` | If `1`, `/metrics` + `/cycles` unauthed. Default requires the same auth header as `/cycle`. |
+| `TRIGGER_RATE_LIMIT_PER_MIN` | no | `6` | Sliding-window rate limit on `POST /cycle`. `0` disables. |
 | `DRY_RUN` | no | `false` | If `1`/`true`, decrypt only — never connect to Steam |
 | `BOOST_RESULT_REPORT` | no | `false` | If truthy, `POST {API_ENDPOINT}/boostResult` per account after each attempt. Leave off unless the bot exposes that route. |
 | `RUST_LOG` | no | `info` | tracing-subscriber `EnvFilter` directive |
@@ -45,27 +54,36 @@ and `SS_PRIVATE_KEY_DB` on its side).
 |---|---|---|
 | `GET /` | none | Liveness — returns `alive` |
 | `GET /healthz` | none | Readiness — `503` if no cycle finished within `2 × interval + deadline`. JSON body includes uptime, seconds-since-last-cycle, and the last cycle summary. |
-| `GET /metrics` | none | Prometheus exposition: `storebooster_cycles_total{status}`, `storebooster_boost_attempts_total{outcome}`, `_boost_attempt_duration_seconds`, `_cycle_duration_seconds`. |
-| `GET /cycles` | none | Last 10 cycle summaries as JSON. |
-| `POST /cycle` | `API_AUTH_HEADER_*` | Trigger a cycle now. `202` queued, `429` if one is already pending, `401` on bad auth. |
+| `GET /metrics` | `API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Prometheus exposition: `storebooster_cycles_total{status}`, `storebooster_boost_attempts_total{outcome,apps}`, `_boost_attempt_duration_seconds`, `_cycle_duration_seconds`. |
+| `GET /cycles` | `API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Last 10 cycle summaries as JSON. |
+| `POST /cycle` | `API_AUTH_HEADER_*` | Trigger a cycle now. `202` queued, `429` if one is already pending or rate-limited (`TRIGGER_RATE_LIMIT_PER_MIN`), `401` on bad auth. |
 
 ## Boost Cycle
 
-Every `BOOST_INTERVAL_SECS` + jitter, or on `POST /cycle`:
-1. `GET {API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit=20`
-2. For each account, spawn a tokio task; the driver sleeps 200 ms between
-   spawns so the N-th account starts 200·(N-1) ms in (stagger without idle
-   tasks).
+Every `BOOST_INTERVAL_SECS` + jitter (or per `BOOST_CRON` if set), or on `POST /cycle`:
+1. `GET {API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit={BOOST_ACCOUNTS_PER_CYCLE}`
+   with up to `BOT_API_MAX_RETRIES` retries on transient failure (exponential
+   backoff + jitter).
+2. For each account, check the in-process cooldown tracker — if the account is
+   currently benched (≥ `BOOST_COOLDOWN_THRESHOLD` consecutive prior failures),
+   it is skipped and counted under `outcome=skipped`. Otherwise spawn a tokio
+   task; the driver sleeps 200 ms between spawns so the N-th account starts
+   200·(N-1) ms in (stagger without idle tasks).
    - decrypt sealed `refreshToken`
    - `SteamClient::log_on(LogOnDetails { refresh_token })` with 15s timeout
-   - `games_played(vec![730])`
+   - `games_played(BOOST_APP_IDS)`
    - Wait up to 30s for `SteamEvent::CSGO(CSGOEvent::Online)`
    - `log_off()`
 3. `BOOST_CYCLE_DEADLINE_SECS` cap on the whole cycle; aggregate counts logged
-   as one JSON event (`boost_cycle_end`).
+   as one JSON event (`boost_cycle_end`). Outcomes classify into `success`,
+   `no_csgo_online`, `log_on_failed`, `invalid_token` (revoked/expired token),
+   `timed_out`, `decrypt_failed`, `dry_run`, `skipped`, `other`.
 4. Per account, fire `POST {API_ENDPOINT}/boostResult` with
    `{ steamId, outcome, elapsedMs }`. Reporting failures are logged but do not
-   fail the cycle.
+   fail the cycle. Skipped accounts are not reported.
+5. If `DISCORD_WEBHOOK_URL` is set and the cycle is degraded (deadline exceeded
+   or success ratio below `BOOST_ALERT_THRESHOLD_RATIO`), an embed is posted to
+   the webhook. Notification failures are logged-only.
 
 If `DRY_RUN=1`, accounts are fetched and refresh tokens decrypted, but the
 Steam connection step is skipped — useful for smoke-testing config without

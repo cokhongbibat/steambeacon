@@ -1,17 +1,21 @@
 mod api_client;
 mod boost;
 mod config;
+mod cooldown;
 mod crypto;
+mod notifier;
 mod state;
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -22,7 +26,11 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use config::AppConfig;
+use cooldown::CooldownTracker;
+use notifier::DiscordNotifier;
 use state::{CycleState, CycleSummary};
+
+const TRIGGER_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AppState {
@@ -31,6 +39,7 @@ struct AppState {
     trigger_tx: mpsc::Sender<()>,
     metrics: PrometheusHandle,
     started_at: Instant,
+    trigger_window: Arc<Mutex<VecDeque<Instant>>>,
 }
 
 #[tokio::main]
@@ -58,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
         cycle_deadline_secs = cfg.cycle_deadline.as_secs(),
         interval_jitter_secs = cfg.interval_jitter.as_secs(),
         app_ids = ?cfg.app_ids,
+        accounts_per_cycle = cfg.accounts_per_cycle,
+        cron = cfg.cron_schedule.is_some(),
+        cooldown_threshold = cfg.cooldown_threshold,
+        cooldown_cycles = cfg.cooldown_cycles,
+        bot_api_max_retries = cfg.bot_api_max_retries,
+        discord_webhook = cfg.discord_webhook_url.is_some(),
+        alert_threshold_ratio = cfg.alert_threshold_ratio,
+        trigger_rate_limit_per_min = cfg.trigger_rate_limit_per_min,
+        public_observability = cfg.public_observability,
         dry_run = cfg.dry_run,
         report_results = cfg.report_results,
         "storebooster_starting"
@@ -73,6 +91,21 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let cycle_state = Arc::new(RwLock::new(CycleState::default()));
+    let cooldown = Arc::new(CooldownTracker::new(
+        cfg.cooldown_threshold,
+        cfg.cooldown_cycles,
+    ));
+    let notifier = match cfg.discord_webhook_url.clone() {
+        Some(url) => match DiscordNotifier::new(url) {
+            Ok(n) => Some(Arc::new(n)),
+            Err(e) => {
+                warn!(error = %e, "discord_notifier_init_failed");
+                None
+            }
+        },
+        None => None,
+    };
+
     let (trigger_tx, trigger_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -82,29 +115,41 @@ async fn main() -> anyhow::Result<()> {
         trigger_tx,
         metrics,
         started_at: Instant::now(),
+        trigger_window: Arc::new(Mutex::new(VecDeque::new())),
     };
 
     let api_for_boost = api_client.clone();
     let cfg_for_boost = cfg.clone();
     let cycle_state_for_boost = cycle_state.clone();
+    let cooldown_for_boost = cooldown.clone();
+    let notifier_for_boost = notifier.clone();
     let shutdown_rx_for_boost = shutdown_rx.clone();
     let boost_handle = tokio::spawn(async move {
         boost::run_cycle_loop(
             api_for_boost,
             cfg_for_boost,
             cycle_state_for_boost,
+            cooldown_for_boost,
+            notifier_for_boost,
             trigger_rx,
             shutdown_rx_for_boost,
         )
         .await;
     });
 
+    let protected_routes = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/cycles", get(cycles_handler))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            observability_auth,
+        ));
+
     let app = Router::new()
         .route("/", get(health_root))
         .route("/healthz", get(health_handler))
-        .route("/metrics", get(metrics_handler))
-        .route("/cycles", get(cycles_handler))
         .route("/cycle", post(trigger_cycle))
+        .merge(protected_routes)
         .with_state(app_state);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -160,8 +205,6 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let cs = state.cycle_state.read().await;
     let now = Instant::now();
 
-    // "stale" if more than 2× interval + 1× deadline has passed since the last
-    // cycle ended. During the grace period after startup, never report stale.
     let max_stale = state.cfg.boost_interval * 2 + state.cfg.cycle_deadline;
     let grace_period = state.cfg.boost_interval + state.cfg.cycle_deadline;
 
@@ -198,6 +241,26 @@ async fn cycles_handler(State(state): State<AppState>) -> Json<Vec<CycleSummary>
     Json(cs.history.iter().cloned().collect())
 }
 
+/// Middleware for `/metrics` and `/cycles`. If `PUBLIC_OBSERVABILITY=1`,
+/// pass through; otherwise require the same auth header pair as `/cycle`.
+async fn observability_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.cfg.public_observability {
+        return next.run(request).await;
+    }
+    let got = headers
+        .get(state.cfg.auth_header_name.as_str())
+        .and_then(|h| h.to_str().ok());
+    if got != Some(state.cfg.auth_header_value.as_str()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    next.run(request).await
+}
+
 async fn trigger_cycle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +271,9 @@ async fn trigger_cycle(
     if got != Some(state.cfg.auth_header_value.as_str()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    if !rate_limit_admit(&state) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
     match state.trigger_tx.try_send(()) {
         Ok(()) => (StatusCode::ACCEPTED, "queued"),
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -217,4 +283,27 @@ async fn trigger_cycle(
             (StatusCode::SERVICE_UNAVAILABLE, "shutting down")
         }
     }
+}
+
+/// Sliding-window rate limit for `/cycle`. Admits if fewer than
+/// `cfg.trigger_rate_limit_per_min` triggers landed in the last 60s.
+fn rate_limit_admit(state: &AppState) -> bool {
+    let limit = state.cfg.trigger_rate_limit_per_min as usize;
+    if limit == 0 {
+        return true; // 0 disables the limit
+    }
+    let now = Instant::now();
+    let mut win = state.trigger_window.lock().unwrap();
+    while let Some(&front) = win.front() {
+        if now.duration_since(front) > TRIGGER_RATE_WINDOW {
+            win.pop_front();
+        } else {
+            break;
+        }
+    }
+    if win.len() >= limit {
+        return false;
+    }
+    win.push_back(now);
+    true
 }
