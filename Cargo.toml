@@ -1,0 +1,46 @@
+[package]
+name = "storebooster"
+version = "0.1.0"
+edition = "2021"
+description = "Periodic Steam store boost — calls a Rust HTTP API for accounts, decrypts refresh tokens, logs in via steam-client-rs, marks playing CS2."
+license = "MIT"
+
+[[bin]]
+name = "storebooster"
+path = "src/main.rs"
+
+[dependencies]
+# Steam protocol
+steam-client-rs = "0.1"
+# HTTP server (Render web service requires PORT bind)
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+# HTTP client for bot API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+# Crypto — AES-256-GCM, wire-compat with discord-natri-bot::crypto_db
+aes-gcm = "0.10"
+hex = "0.4"
+# Legacy CBC fallback (matches crypto_db.rs's decrypt_cbc)
+cbc = { version = "0.1", features = ["std"] }
+aes = "0.8"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+# Memory hygiene for plaintext refresh tokens
+zeroize = "1"
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Env
+dotenvy = "0.15"
+# Error handling
+anyhow = "1"
+thiserror = "2"
+# Random for jitter
+rand = "0.8"
+# Futures
+futures = "0.3"
