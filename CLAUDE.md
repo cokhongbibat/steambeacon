@@ -30,6 +30,7 @@ All env loading goes through `AppConfig::from_env`. Required vars (`API_ENDPOINT
 - `BOOST_CYCLE_DEADLINE_SECS` (default 900 = 15 min)
 - `BOOST_APP_IDS` (comma-separated, default `730` = CS2)
 - `DRY_RUN` (truthy values: `1`, `true`, `yes` — case-insensitive)
+- `BOOST_RESULT_REPORT` (same truthy parsing as `DRY_RUN`; off by default — only flip on once the bot exposes `POST /boostResult`)
 
 `config::require_env_first(&["A", "B"])` is the canonical pattern for "use A, fall back to B". `crypto::init_key` uses it for `SS_PRIVATE_KEY_DB` → `PRIVATE_KEY_DB`.
 
@@ -47,10 +48,13 @@ All env loading goes through `AppConfig::from_env`. Required vars (`API_ENDPOINT
 
 1. `ApiClient::fetch_random_store_accounts_with_token(20)` → `GET {API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit=20`, expects `{ "result": [{ steamId, refreshToken }] }`. The `refreshToken` field is a sealed payload from the companion `discord-natri-bot` service.
 2. The driver sleeps 200ms *between* spawns so the N-th account starts 200·(N-1) ms after the cycle begins — staggered without leaving N idle tokio tasks sleeping.
-3. Per-account: `crypto::decrypt_data` → `SteamClient::log_on` (15s timeout) → `games_played(vec![730])` (CS2 app id) → poll `SteamEvent`s up to 30s for `CSGOEvent::Online` → `log_off`.
-4. `join_all` under a cycle deadline (default 15 min, override with `BOOST_CYCLE_DEADLINE_SECS`); aggregate counts are emitted as a single JSON tracing event.
+3. Per-account: `crypto::decrypt_data` → `SteamClient::log_on` (15s timeout) → `games_played(vec![730])` (CS2 app id) → poll `SteamEvent`s up to 30s for `CSGOEvent::Online` → `log_off`. The decrypted refresh token is wrapped in `Zeroizing` so our local copy is wiped on drop; the clone handed to `LogOnDetails` lives inside `steam-client-rs` and is out of our hands.
+4. `join_all` under a cycle deadline (default 15 min, override with `BOOST_CYCLE_DEADLINE_SECS`); aggregate counts are emitted as a single JSON tracing event (`boost_cycle_end`).
+5. If `BOOST_RESULT_REPORT` is truthy, each per-account outcome is reported via `POST {API_ENDPOINT}/boostResult` with `{ steamId, outcome, elapsedMs }` (`BoostReport` in `src/api_client.rs`). Reports are spawned as detached tasks and `join_all`'d under a 30s `REPORT_BATCH_TIMEOUT`; failures are logged but never fail the cycle.
 
 There is **no retry** and **no persistent bad-account state**. Failed accounts get fresh refresh tokens from the bot's own cron jobs on the next cycle.
+
+`BoostOutcome` labels (drive the `outcome=` metric label and the reported outcome string): `success`, `no_csgo_online`, `log_on_failed`, `decrypt_failed`, `timed_out`, `dry_run`, `other`, plus `panic` emitted only by the cycle aggregator when a per-account task panics.
 
 ### Crypto wire format
 

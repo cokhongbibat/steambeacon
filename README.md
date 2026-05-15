@@ -32,6 +32,7 @@ startup rather than running broken.
 | `BOOST_CYCLE_DEADLINE_SECS` | no | `900` (15 min) | Per-cycle hard deadline |
 | `BOOST_APP_IDS` | no | `730` | Comma-separated Steam app ids passed to `games_played` |
 | `DRY_RUN` | no | `false` | If `1`/`true`, decrypt only — never connect to Steam |
+| `BOOST_RESULT_REPORT` | no | `false` | If truthy, `POST {API_ENDPOINT}/boostResult` per account after each attempt. Leave off unless the bot exposes that route. |
 | `RUST_LOG` | no | `info` | tracing-subscriber `EnvFilter` directive |
 
 `API_AUTH_HEADER_NAME`/`VALUE` and the private key must match the values
