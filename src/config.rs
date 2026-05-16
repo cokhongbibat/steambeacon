@@ -107,9 +107,9 @@ impl AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(3000);
 
-        let (_, api_endpoint) = require_env_first(&["API_ENDPOINT"])?;
-        let (_, auth_header_name) = require_env_first(&["API_AUTH_HEADER_NAME"])?;
-        let (_, auth_header_value) = require_env_first(&["API_AUTH_HEADER_VALUE"])?;
+        let (_, api_endpoint) = require_env_first(&["SS_API_ENDPOINT"])?;
+        let (_, auth_header_name) = require_env_first(&["SS_API_AUTH_HEADER_NAME"])?;
+        let (_, auth_header_value) = require_env_first(&["SS_API_AUTH_HEADER_VALUE"])?;
 
         let app_ids = parse_app_ids(&std::env::var("BOOST_APP_IDS").unwrap_or_default())?;
         let dry_run = bool_env("DRY_RUN");

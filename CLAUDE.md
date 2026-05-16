@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build: `cargo build` (debug) / `cargo build --release` (deploy artifact)
-- Run locally: `cargo run --release` (requires `.env` with `SS_PRIVATE_KEY_DB`, `API_ENDPOINT`, `API_AUTH_HEADER_NAME`, `API_AUTH_HEADER_VALUE`)
+- Run locally: `cargo run --release` (requires `.env` with `SS_PRIVATE_KEY_DB`, `SS_API_ENDPOINT`, `SS_API_AUTH_HEADER_NAME`, `SS_API_AUTH_HEADER_VALUE`)
 - Lint: `cargo clippy`
 - Tests: `cargo test`
 - Single test: `cargo test --package storebooster -- crypto::tests::test_decrypt_gcm_roundtrip --exact`
@@ -22,7 +22,7 @@ Both share `AppState { cfg, cycle_state, trigger_tx, metrics, started_at }`. The
 
 ### Configuration (`src/config.rs`)
 
-All env loading goes through `AppConfig::from_env`. Required vars (`API_ENDPOINT`, `API_AUTH_HEADER_NAME`, `API_AUTH_HEADER_VALUE`) **fail-closed** — missing or empty means the process bails with a non-zero exit. Optional knobs:
+All env loading goes through `AppConfig::from_env`. Required vars (`SS_API_ENDPOINT`, `SS_API_AUTH_HEADER_NAME`, `SS_API_AUTH_HEADER_VALUE`) **fail-closed** — missing or empty means the process bails with a non-zero exit. Optional knobs:
 
 - `PORT` (default 3000)
 - `BOOST_INTERVAL_SECS` (default 1200 = 20 min)
@@ -54,13 +54,13 @@ All env loading goes through `AppConfig::from_env`. Required vars (`API_ENDPOINT
 
 ### Boost cycle flow (`boost::run_cycle`)
 
-1. `ApiClient::fetch_random_store_accounts_with_token(BOOST_ACCOUNTS_PER_CYCLE, BOT_API_MAX_RETRIES)` → `GET {API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit=…`, expects `{ "result": [{ steamId, refreshToken }] }`. The `refreshToken` field is a sealed payload from the companion `discord-natri-bot` service. The fetch is the *only* call with built-in retry; per-account log-on is single-shot.
+1. `ApiClient::fetch_random_store_accounts_with_token(BOOST_ACCOUNTS_PER_CYCLE, BOT_API_MAX_RETRIES)` → `GET {SS_API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit=…`, expects `{ "result": [{ steamId, refreshToken }] }`. The `refreshToken` field is a sealed payload from the companion `discord-natri-bot` service. The fetch is the *only* call with built-in retry; per-account log-on is single-shot.
 2. Each `steam_id` is checked against the in-process `CooldownTracker` (`src/cooldown.rs`). An account with ≥ `BOOST_COOLDOWN_THRESHOLD` consecutive prior failures is skipped (`outcome=skipped`) and not even spawned. Skip slots decrement once per cycle; a single `Success` outcome wipes the account's failure state.
 3. The driver sleeps 200ms *between* spawns so the N-th account starts 200·(N-1) ms after the cycle begins — staggered without leaving N idle tokio tasks sleeping.
 4. Per-account: `crypto::decrypt_data` → `SteamClient::log_on` (15s timeout) → `games_played(cfg.app_ids)` → poll `SteamEvent`s up to 30s for `CSGOEvent::Online` → `log_off`. The decrypted refresh token is wrapped in `Zeroizing` so our local copy is wiped on drop; the clone handed to `LogOnDetails` lives inside `steam-client-rs` and is out of our hands.
 5. `boost::looks_like_token_problem` classifies a log-on error as `InvalidToken` (revoked/expired/`AccessDenied`/`InvalidPassword`/etc.) vs the generic `LogOnFailed` bucket. Only `looks_like_token_problem`-recognised substrings should be added here — anything broader makes the bot's rotate-token signal noisy.
 6. `join_all` under a cycle deadline (default 15 min, override with `BOOST_CYCLE_DEADLINE_SECS`); aggregate counts are emitted as a single JSON tracing event (`boost_cycle_end`).
-7. If `BOOST_RESULT_REPORT` is truthy, each per-account outcome (except `skipped`) is reported via `POST {API_ENDPOINT}/boostResult` with `{ steamId, outcome, elapsedMs }` (`BoostReport` in `src/api_client.rs`). Reports are spawned as detached tasks and `join_all`'d under a 30s `REPORT_BATCH_TIMEOUT`; failures are logged but never fail the cycle.
+7. If `BOOST_RESULT_REPORT` is truthy, each per-account outcome (except `skipped`) is reported via `POST {SS_API_ENDPOINT}/boostResult` with `{ steamId, outcome, elapsedMs }` (`BoostReport` in `src/api_client.rs`). Reports are spawned as detached tasks and `join_all`'d under a 30s `REPORT_BATCH_TIMEOUT`; failures are logged but never fail the cycle.
 8. If `DISCORD_WEBHOOK_URL` is set and the cycle is degraded (deadline exceeded, or `succeeded / (total - skipped)` below `BOOST_ALERT_THRESHOLD_RATIO`), `DiscordNotifier::notify_cycle_alert` posts an embed. Notifier errors are logged-only. There is no per-account alerting — only cycle-level.
 
 There is **no per-account retry** (only the bot API fetch retries) and **no persistent bad-account state across restarts**. Failed accounts get fresh refresh tokens from the bot's own cron jobs on the next cycle; the cooldown tracker only protects within a process lifetime.
@@ -75,7 +75,7 @@ Metric `storebooster_boost_attempts_total` carries two labels: `outcome` (above)
 
 ### HTTP middleware
 
-`/metrics` and `/cycles` are wrapped in `observability_auth` middleware that requires the same `API_AUTH_HEADER_*` pair as `/cycle` unless `PUBLIC_OBSERVABILITY=1`. `/`, `/healthz` are always public so Render's health checks work.
+`/metrics` and `/cycles` are wrapped in `observability_auth` middleware that requires the same `SS_API_AUTH_HEADER_*` pair as `/cycle` unless `PUBLIC_OBSERVABILITY=1`. `/`, `/healthz` are always public so Render's health checks work.
 
 `POST /cycle` has a sliding-window rate limit (`TRIGGER_RATE_LIMIT_PER_MIN` per 60s) backed by `AppState::trigger_window: Arc<Mutex<VecDeque<Instant>>>`. This is independent of the `mpsc(1)` queue, which already coalesces in-flight triggers — the rate limit protects against burst auth checks before the channel sees them.
 
@@ -92,7 +92,7 @@ The 32-byte key comes from `SS_PRIVATE_KEY_DB` (64 hex chars). `crypto::init_key
 
 ### API client contract
 
-`ApiClient` (in `src/api_client.rs`) talks to the discord-natri-bot HTTP API. Auth is a single arbitrary header pair (`API_AUTH_HEADER_NAME` / `API_AUTH_HEADER_VALUE`) — the bot uses these names too (`SS_API_AUTH_HEADER_NAME`/`VALUE` on its side), so the values must be kept in sync. The response envelope is `WrappedResult<T> { result: T }`; if the bot is ever changed to return bare arrays, this struct needs updating.
+`ApiClient` (in `src/api_client.rs`) talks to the discord-natri-bot HTTP API. Auth is a single arbitrary header pair (`SS_API_AUTH_HEADER_NAME` / `SS_API_AUTH_HEADER_VALUE`) — the bot uses these names too (`SS_API_AUTH_HEADER_NAME`/`VALUE` on its side), so the values must be kept in sync. The response envelope is `WrappedResult<T> { result: T }`; if the bot is ever changed to return bare arrays, this struct needs updating.
 
 ### Logging
 
@@ -100,7 +100,7 @@ The 32-byte key comes from `SS_PRIVATE_KEY_DB` (64 hex chars). `crypto::init_key
 
 ## Deployment
 
-Render web service. `cargo build --release` then `./target/release/storebooster`. Render injects `PORT`; everything else comes from the service's env config and must match the companion `discord-natri-bot` service exactly for `API_AUTH_HEADER_*` and `SS_PRIVATE_KEY_DB`.
+Render web service. `cargo build --release` then `./target/release/storebooster`. Render injects `PORT`; everything else comes from the service's env config and must match the companion `discord-natri-bot` service exactly for `SS_API_AUTH_HEADER_*` and `SS_PRIVATE_KEY_DB`.
 
 ## Project history note
 

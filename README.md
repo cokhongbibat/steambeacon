@@ -11,7 +11,7 @@ binds `PORT`, runs the boost cycle as a tokio task in the same process.
 ## Build & Run (local)
 
     cp .env.example .env   # if you have one; otherwise create it
-    # Fill in API_ENDPOINT, API_AUTH_HEADER_*, SS_PRIVATE_KEY_DB
+    # Fill in SS_API_ENDPOINT, SS_API_AUTH_HEADER_*, SS_PRIVATE_KEY_DB
     cargo run --release
 
 ## Env Vars
@@ -22,9 +22,9 @@ startup rather than running broken.
 | Var | Required | Default | Purpose |
 |---|---|---|---|
 | `PORT` | no | `3000` | Render-provided; axum binds here |
-| `API_ENDPOINT` | **yes** | — | discord-natri-bot HTTP API base URL |
-| `API_AUTH_HEADER_NAME` | **yes** | — | Auth header name (e.g. `auth-x-secret`) |
-| `API_AUTH_HEADER_VALUE` | **yes** | — | Auth header value (also gates `POST /cycle`) |
+| `SS_API_ENDPOINT` | **yes** | — | discord-natri-bot HTTP API base URL |
+| `SS_API_AUTH_HEADER_NAME` | **yes** | — | Auth header name (e.g. `auth-x-secret`) |
+| `SS_API_AUTH_HEADER_VALUE` | **yes** | — | Auth header value (also gates `POST /cycle`) |
 | `SS_PRIVATE_KEY_DB` | **yes** *(or `PRIVATE_KEY_DB`)* | — | 32-byte hex (64 chars) AES-256 key for refresh-token decrypt |
 | `PRIVATE_KEY_DB` | fallback | — | Used only if `SS_PRIVATE_KEY_DB` is unset/empty |
 | `BOOST_INTERVAL_SECS` | no | `1200` (20 min) | Cycle wake interval |
@@ -41,10 +41,10 @@ startup rather than running broken.
 | `PUBLIC_OBSERVABILITY` | no | `false` | If `1`, `/metrics` + `/cycles` unauthed. Default requires the same auth header as `/cycle`. |
 | `TRIGGER_RATE_LIMIT_PER_MIN` | no | `6` | Sliding-window rate limit on `POST /cycle`. `0` disables. |
 | `DRY_RUN` | no | `false` | If `1`/`true`, decrypt only — never connect to Steam |
-| `BOOST_RESULT_REPORT` | no | `false` | If truthy, `POST {API_ENDPOINT}/boostResult` per account after each attempt. Leave off unless the bot exposes that route. |
+| `BOOST_RESULT_REPORT` | no | `false` | If truthy, `POST {SS_API_ENDPOINT}/boostResult` per account after each attempt. Leave off unless the bot exposes that route. |
 | `RUST_LOG` | no | `info` | tracing-subscriber `EnvFilter` directive |
 
-`API_AUTH_HEADER_NAME`/`VALUE` and the private key must match the values
+`SS_API_AUTH_HEADER_NAME`/`VALUE` and the private key must match the values
 configured on the companion `discord-natri-bot` service (`SS_API_AUTH_HEADER_*`
 and `SS_PRIVATE_KEY_DB` on its side).
 
@@ -54,14 +54,14 @@ and `SS_PRIVATE_KEY_DB` on its side).
 |---|---|---|
 | `GET /` | none | Liveness — returns `alive` |
 | `GET /healthz` | none | Readiness — `503` if no cycle finished within `2 × interval + deadline`. JSON body includes uptime, seconds-since-last-cycle, and the last cycle summary. |
-| `GET /metrics` | `API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Prometheus exposition: `storebooster_cycles_total{status}`, `storebooster_boost_attempts_total{outcome,apps}`, `_boost_attempt_duration_seconds`, `_cycle_duration_seconds`. |
-| `GET /cycles` | `API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Last 10 cycle summaries as JSON. |
-| `POST /cycle` | `API_AUTH_HEADER_*` | Trigger a cycle now. `202` queued, `429` if one is already pending or rate-limited (`TRIGGER_RATE_LIMIT_PER_MIN`), `401` on bad auth. |
+| `GET /metrics` | `SS_API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Prometheus exposition: `storebooster_cycles_total{status}`, `storebooster_boost_attempts_total{outcome,apps}`, `_boost_attempt_duration_seconds`, `_cycle_duration_seconds`. |
+| `GET /cycles` | `SS_API_AUTH_HEADER_*` *(unauthed if `PUBLIC_OBSERVABILITY=1`)* | Last 10 cycle summaries as JSON. |
+| `POST /cycle` | `SS_API_AUTH_HEADER_*` | Trigger a cycle now. `202` queued, `429` if one is already pending or rate-limited (`TRIGGER_RATE_LIMIT_PER_MIN`), `401` on bad auth. |
 
 ## Boost Cycle
 
 Every `BOOST_INTERVAL_SECS` + jitter (or per `BOOST_CRON` if set), or on `POST /cycle`:
-1. `GET {API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit={BOOST_ACCOUNTS_PER_CYCLE}`
+1. `GET {SS_API_ENDPOINT}/getRandomStoreMyAccountWithToken?limit={BOOST_ACCOUNTS_PER_CYCLE}`
    with up to `BOT_API_MAX_RETRIES` retries on transient failure (exponential
    backoff + jitter).
 2. For each account, check the in-process cooldown tracker — if the account is
@@ -78,7 +78,7 @@ Every `BOOST_INTERVAL_SECS` + jitter (or per `BOOST_CRON` if set), or on `POST /
    as one JSON event (`boost_cycle_end`). Outcomes classify into `success`,
    `no_csgo_online`, `log_on_failed`, `invalid_token` (revoked/expired token),
    `timed_out`, `decrypt_failed`, `dry_run`, `skipped`, `other`.
-4. Per account, fire `POST {API_ENDPOINT}/boostResult` with
+4. Per account, fire `POST {SS_API_ENDPOINT}/boostResult` with
    `{ steamId, outcome, elapsedMs }`. Reporting failures are logged but do not
    fail the cycle. Skipped accounts are not reported.
 5. If `DISCORD_WEBHOOK_URL` is set and the cycle is degraded (deadline exceeded
@@ -117,9 +117,9 @@ service required.
 
 | Var | Value to set |
 |---|---|
-| `API_ENDPOINT` | URL of the companion `discord-natri-bot` service |
-| `API_AUTH_HEADER_NAME` | Same string as bot's `SS_API_AUTH_HEADER_NAME` |
-| `API_AUTH_HEADER_VALUE` | Same string as bot's `SS_API_AUTH_HEADER_VALUE` |
+| `SS_API_ENDPOINT` | URL of the companion `discord-natri-bot` service |
+| `SS_API_AUTH_HEADER_NAME` | Same string as bot's `SS_API_AUTH_HEADER_NAME` |
+| `SS_API_AUTH_HEADER_VALUE` | Same string as bot's `SS_API_AUTH_HEADER_VALUE` |
 | `SS_PRIVATE_KEY_DB` | Same 64-hex string as bot's `SS_PRIVATE_KEY_DB` |
 | `RUST_LOG` | `info` (or `info,storebooster=debug` while debugging) |
 
