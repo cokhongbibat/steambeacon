@@ -157,4 +157,3 @@ mod tests {
         assert!(backoff_for(99).as_millis() <= 8_200);
     }
 }
-
